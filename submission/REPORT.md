@@ -3,42 +3,42 @@
 Phần phân tích tối đa một trang, không tính output ở phần 5.
 Định dạng tham chiếu và phạm vi tính trang: [SUBMISSION.md](../docs/SUBMISSION.md).
 
-**Họ tên / MSSV:** Đỗ Quang Vinh / 2A202602989
-**Repo:** https://github.com/quangvinh12a1/K4-Track02-Day17-DoQuangVinh-2A202602989-DataPipelineEngineering
-**Commit bài nộp:** commit cuối trên nhánh `main` (xem lịch sử Git)
-**AI đã dùng và phạm vi hỗ trợ (hoặc không dùng):** Claude Code (Claude Opus 5.5): đọc code, đề xuất 3 cách sửa, chạy lệnh kiểm chứng, nháp REPORT. Tôi đã review từng thay đổi và tự giải thích được.
-**Nguồn tham khảo khác (nếu có):** Slide Ngày 17; tài liệu Debezium (định dạng change event, tombstone).
+- **Họ tên / MSSV:** Đỗ Quang Vinh / 2A202602989
+- **Repo:** https://github.com/quangvinh12a1/K4-Track02-Day17-DoQuangVinh-2A202602989-DataPipelineEngineering
+- **Commit bài nộp:** `b346320` (commit mã nguồn cuối; output ở phần 5 chạy trên commit này)
+- **AI đã dùng và phạm vi hỗ trợ:** Claude Code (Claude Opus 5.5) — đọc code, đề xuất cách sửa, chạy lệnh kiểm chứng, nháp REPORT và bonus. Tôi đã review và giải thích được mọi thay đổi.
+- **Nguồn tham khảo khác:** slide Ngày 17; tài liệu Debezium (change event, tombstone).
 
 ## 1. Ba lỗi
 
 | | Lỗi Silver | Lỗi late data | Lỗi xoá (CDC) |
 |---|---|---|---|
-| **Triệu chứng** | verify: `silver_tickets` 24 dòng cho 12 ticket; T-91 có 3 dòng (low/open, high/open, high/closed/bug); kéo theo `gold_doc_chunks` 22 dòng / 9 chunk | `gold_feature_daily` lệch full recompute (`c50b8851affe` ≠ `8630e04a61d1`); u05 ngày 08-12 ra (2, 0) thay vì (5, 1); `LOOKBACK_DAYS=0` < P99 = 3 | T-97 trong Silver `is_deleted=False`, còn tên + nội dung; snapshot mới nhất còn T-97; RAG index còn 2 chunk T-97 |
-| **Nguyên nhân gốc** | `upsert_silver_tickets` chỉ dedup *trong* batch rồi `INSERT` — mỗi batch thêm hàng mới, không ghi theo khoá giữa các batch | Feature tính theo `event_time` nhưng mỗi run chỉ recompute đúng ngày của nó; event offline của u05 (xảy ra 08-12, đến 08-15) rơi vào partition 08-12 không bao giờ được tính lại | `ticket_changes_sql` lấy `ticket_id` từ `after`; với `op='d'` thì `after = null` → `ticket_id` null → bản ghi delete bị filter `WHERE ticket_id IS NOT NULL` vứt bỏ |
-| **Cách sửa** | `pipeline/silver.py`: đổi `INSERT` thành `MERGE ... ON ticket_id`, `WHEN MATCHED AND s._lsn > t._lsn THEN UPDATE`, `WHEN NOT MATCHED THEN INSERT` | `pipeline/config.py`: `LOOKBACK_DAYS = 3` = ceil(P99 = 3.00 ngày); mỗi run xoá + tính lại các partition `[day-3, day]` theo event date | `pipeline/staging.py`: `ticket_id = coalesce(key.ticket_id, after.ticket_id, before.ticket_id)`; tombstone Kafka (`value=null`) vẫn bị bỏ qua nhờ `_op IS NOT NULL` |
-| **Khái niệm trên slide** | Silver có khoá: MERGE/upsert idempotent; LSN làm thứ tự — replay batch cũ không ghi đè trạng thái mới | Event time vs processing time, lateness đo được, lookback + overwrite-partition | CDC log-based: phong bì Debezium (`before`/`after`/`op`), delete → tombstone trong Silver, xoá truyền xuống Gold |
+| **Triệu chứng** | verify: `silver_tickets` 24 dòng cho 12 ticket; T-91 có 3 trạng thái | `gold_feature_daily` lệch full recompute (`c50b…` ≠ `8630…`); u05 ngày 08-12 = (2, 0), cần (5, 1) | T-97 `is_deleted=False`, còn tên/nội dung; còn trong snapshot mới nhất và 2 chunk RAG |
+| **Nguyên nhân gốc** | Chỉ dedup trong batch rồi `INSERT`: mỗi batch thêm hàng, không ghi theo khoá | `LOOKBACK_DAYS=0`: event đến muộn 3 ngày rơi vào partition không bao giờ được tính lại | Lấy `ticket_id` từ `after`; delete có `after=null` → id null → bị lọc mất |
+| **Cách sửa** | `silver.py`: `MERGE ON ticket_id`, chỉ `UPDATE` khi `s._lsn > t._lsn` | `config.py`: `LOOKBACK_DAYS = 3` | `staging.py`: `coalesce(key, after, before).ticket_id` |
+| **Khái niệm** | Silver có khoá, upsert idempotent, LSN chống ghi đè khi replay | Event time vs ingest time, lookback + overwrite-partition | CDC log-based, tombstone, xoá lan xuống Gold |
 
 ## 2. Các con số
 
-- P99 lateness đo từ Bronze: `3.00` ngày (P50 = 0.00, P95 = 2.90, max = 3, 43 bản ghi) → `LOOKBACK_DAYS = 3` (làm tròn lên theo ngày lịch để phủ hết P99, ở đây trùng với max)
-- `submission/checksums.txt`: **PASS** — Gold checksum: `39e115c510ecdf526800eac227158a4f`
-- `make parity`: **PARITY** (`silver_tickets` 3c15dfd43701, `gold_feature_daily` 8630e04a61d1)
+- P99 lateness đo từ Bronze: `3.00` ngày (P50 0.00, P95 2.90, max 3) → `LOOKBACK_DAYS = 3` = ceil(P99), đơn vị ngày lịch.
+- `submission/checksums.txt`: **PASS** — Gold checksum `39e115c510ecdf526800eac227158a4f`
+- Parity: **PARITY** (`silver_tickets` và `gold_feature_daily` trùng checksum)
 
-## 3. Lựa chọn công cụ / kỹ thuật (mỗi dòng một câu "vì sao")
+## 3. Lựa chọn công cụ / kỹ thuật
 
-- MERGE theo khoá cho `silver_tickets`, overwrite-partition cho `gold_feature_daily`: Silver là trạng thái hiện tại của một thực thể nên cập nhật theo khoá + LSN, còn feature là aggregate theo ngày nên xoá và tính lại cả cửa sổ lookback từ Silver là cách idempotent đơn giản nhất.
-- Tombstone thay vì xoá hẳn hàng trong Silver: giữ `ticket_id` + `_lsn` của lệnh xoá để replay batch cũ (LSN nhỏ hơn) không "hồi sinh" ticket, đồng thời các cột PII đã null nên vẫn thoả yêu cầu xoá dữ liệu.
-- Snapshot training dựng lại từ Bronze "as of" ngày đó, không sửa snapshot cũ: model đã train trên `v<day>` phải tái lập được; dữ liệu đến muộn tạo version mới thay vì âm thầm thay đổi tập train cũ.
-- DuckDB (lite) / dbt (track dbt) cho bài toán cỡ này, chứ không phải Spark: dữ liệu vài chục dòng/ngày vừa một máy, DuckDB chạy in-process không cần cluster, dbt cho contract/test/incremental khai báo — Spark chỉ thêm chi phí vận hành.
+- **MERGE vs overwrite-partition:** ticket là thực thể có khoá nên cập nhật theo khoá + LSN; feature là aggregate theo ngày nên xoá và tính lại cả cửa sổ lookback từ Silver là cách idempotent đơn giản nhất.
+- **Tombstone thay vì xoá hẳn:** giữ `ticket_id` + LSN của lệnh xoá để replay batch cũ không "hồi sinh" ticket; cột PII đã null nên vẫn đáp ứng yêu cầu xoá.
+- **Snapshot dựng lại từ Bronze "as of":** model đã train trên `v<day>` phải tái lập được; dữ liệu muộn tạo version mới thay vì âm thầm sửa tập cũ.
+- **DuckDB/dbt thay vì Spark:** vài chục dòng/ngày vừa một máy; DuckDB chạy in-process, dbt cho contract/test/incremental khai báo; Spark chỉ thêm chi phí vận hành.
 
 ## 4. Hai câu hỏi suy ngẫm
 
-1. Tôi coi snapshot là bất biến *về nội dung huấn luyện* nhưng không bất biến trước nghĩa vụ pháp lý: khi có yêu cầu xoá, chạy một job "erasure" ghi đè/loại bỏ hàng của T-97 trong mọi snapshot cũ (hoặc mã hoá PII theo từng user và huỷ khoá — crypto-shredding), ghi log audit version nào bị sửa và vì sao, rồi retrain model dùng các snapshot đó nếu cần. Bronze cũng phải áp dụng cùng cơ chế, nếu không rebuild sẽ khôi phục lại dữ liệu.
-2. Đặt chốt PII ở ranh giới Bronze → Silver (chỗ `mask_pii`): thêm NER tiếng Việt (vd. underthesea/PhoBERT NER) để che tên người, kết hợp danh sách tên/địa chỉ đã biết từ bảng user; Bronze chỉ cho số ít người truy cập. Đo bằng một tập mẫu gán nhãn tay (precision/recall của che PII), cộng contract tự động đếm số dòng Silver/Gold còn khớp detector PII (phải = 0) và giám sát tỷ lệ che theo ngày.
+1. Snapshot bất biến về *nội dung huấn luyện* nhưng không đứng trên nghĩa vụ pháp lý: chạy job erasure loại T-97 khỏi mọi snapshot cũ và Bronze (hoặc crypto-shredding: mã hoá PII theo user, huỷ khoá khi có yêu cầu xoá), ghi audit log version nào bị sửa, rồi retrain nếu cần.
+2. Đặt chốt ở ranh giới Bronze → Silver (cạnh `mask_pii`): thêm NER tiếng Việt để che tên, đối chiếu với danh sách tên trong bảng user. Đo bằng tập mẫu gán nhãn tay (precision/recall) và một contract đếm số dòng Silver/Gold còn bị detector PII bắt (phải = 0), theo dõi theo ngày.
 
 ## 5. Output (dán nguyên văn)
 
-Chạy trên Windows PowerShell, `$env:PYTHONUTF8='1'` (console cp1252 không in được tiếng Việt).
+Chạy trên Windows PowerShell với `$env:PYTHONUTF8='1'` (console cp1252 không in được tiếng Việt) và `$env:DO_NOT_TRACK='1'`.
 
 ```text
 $ .\.venv\Scripts\python.exe main.py
@@ -83,7 +83,7 @@ re-run checksums written to submission/checksums.txt
 
 $ .\.venv\Scripts\python.exe -m pytest
 ..................................                                       [100%]
-34 passed in 2.43s
+34 passed in 2.57s
 
 $ .\.venv\Scripts\python.exe -m scripts.rerun_check
 # Lab 17 — re-run check for 2026-08-12
@@ -102,70 +102,70 @@ event lateness over 43 Bronze records (calendar days): p50=0.00 p95=2.90 p99=3.0
 
 $ .\.venv\Scripts\python.exe main.py --land-only
 $ cd dbt_project; ..\.venv\Scripts\dbt.exe build --profiles-dir . --event-time-start 2026-08-10 --event-time-end 2026-08-17
-02:53:08  Running with dbt=1.12.5
-02:53:08  Registered adapter: duckdb=1.11.0
-02:53:09  Found 5 models, 13 data tests, 2 sources, 502 macros, 1 unit test
-02:53:09  
-02:53:09  Concurrency: 1 threads (target='dev')
-02:53:09  
-02:53:09  1 of 19 START sql view model main.stg_events ................................... [RUN]
-02:53:09  1 of 19 OK created sql view model main.stg_events .............................. [OK in 0.07s]
-02:53:09  2 of 19 START sql view model main.stg_ticket_changes ........................... [RUN]
-02:53:09  2 of 19 OK created sql view model main.stg_ticket_changes ...................... [OK in 0.04s]
-02:53:09  3 of 19 START sql incremental model main.silver_events ......................... [RUN]
-02:53:09  3 of 19 OK created sql incremental model main.silver_events .................... [OK in 0.16s]
-02:53:09  4 of 19 START unit_test silver_tickets::silver_tickets_latest_change_wins_and_delete_is_tombstone  [RUN]
-02:53:09  4 of 19 PASS silver_tickets::silver_tickets_latest_change_wins_and_delete_is_tombstone  [PASS in 0.14s]
-02:53:09  8 of 19 START sql incremental model main.silver_tickets ........................ [RUN]
-02:53:10  8 of 19 OK created sql incremental model main.silver_tickets ................... [OK in 0.22s]
-02:53:10  5 of 19 START test not_null_silver_events_event_id ............................. [RUN]
-02:53:10  5 of 19 PASS not_null_silver_events_event_id ................................... [PASS in 0.04s]
-02:53:10  6 of 19 START test not_null_silver_events_user_id .............................. [RUN]
-02:53:10  6 of 19 PASS not_null_silver_events_user_id .................................... [PASS in 0.03s]
-02:53:10  7 of 19 START test unique_silver_events_event_id ............................... [RUN]
-02:53:10  7 of 19 PASS unique_silver_events_event_id ..................................... [PASS in 0.03s]
-02:53:10  9 of 19 START test accepted_values_silver_tickets_category__bug__billing__other  [RUN]
-02:53:10  9 of 19 PASS accepted_values_silver_tickets_category__bug__billing__other ...... [PASS in 0.05s]
-02:53:10  10 of 19 START test accepted_values_silver_tickets_priority__low__medium__high . [RUN]
-02:53:10  10 of 19 PASS accepted_values_silver_tickets_priority__low__medium__high ....... [PASS in 0.03s]
-02:53:10  11 of 19 START test accepted_values_silver_tickets_status__open__pending__closed  [RUN]
-02:53:10  11 of 19 PASS accepted_values_silver_tickets_status__open__pending__closed ..... [PASS in 0.04s]
-02:53:10  12 of 19 START test not_null_silver_tickets__lsn ............................... [RUN]
-02:53:10  12 of 19 PASS not_null_silver_tickets__lsn ..................................... [PASS in 0.02s]
-02:53:10  13 of 19 START test not_null_silver_tickets_is_deleted ......................... [RUN]
-02:53:10  13 of 19 PASS not_null_silver_tickets_is_deleted ............................... [PASS in 0.03s]
-02:53:10  14 of 19 START test not_null_silver_tickets_ticket_id .......................... [RUN]
-02:53:10  14 of 19 PASS not_null_silver_tickets_ticket_id ................................ [PASS in 0.02s]
-02:53:10  15 of 19 START test unique_silver_tickets_ticket_id ............................ [RUN]
-02:53:10  15 of 19 PASS unique_silver_tickets_ticket_id .................................. [PASS in 0.02s]
-02:53:10  16 of 19 START sql microbatch model main.gold_feature_daily .................... [RUN]
-02:53:10  Batch 1 of 7 START batch 2026-08-10 of main.gold_feature_daily ....................... [RUN]
-02:53:10  Batch 1 of 7 OK created batch 2026-08-10 of main.gold_feature_daily .................. [OK in 0.05s]
-02:53:10  Batch 2 of 7 START batch 2026-08-11 of main.gold_feature_daily ....................... [RUN]
-02:53:10  Batch 2 of 7 OK created batch 2026-08-11 of main.gold_feature_daily .................. [OK in 0.03s]
-02:53:10  Batch 3 of 7 START batch 2026-08-12 of main.gold_feature_daily ....................... [RUN]
-02:53:10  Batch 3 of 7 OK created batch 2026-08-12 of main.gold_feature_daily .................. [OK in 0.05s]
-02:53:10  Batch 4 of 7 START batch 2026-08-13 of main.gold_feature_daily ....................... [RUN]
-02:53:10  Batch 4 of 7 OK created batch 2026-08-13 of main.gold_feature_daily .................. [OK in 0.02s]
-02:53:10  Batch 5 of 7 START batch 2026-08-14 of main.gold_feature_daily ....................... [RUN]
-02:53:10  Batch 5 of 7 OK created batch 2026-08-14 of main.gold_feature_daily .................. [OK in 0.03s]
-02:53:10  Batch 6 of 7 START batch 2026-08-15 of main.gold_feature_daily ....................... [RUN]
-02:53:10  Batch 6 of 7 OK created batch 2026-08-15 of main.gold_feature_daily .................. [OK in 0.04s]
-02:53:10  Batch 7 of 7 START batch 2026-08-16 of main.gold_feature_daily ....................... [RUN]
-02:53:10  Batch 7 of 7 OK created batch 2026-08-16 of main.gold_feature_daily .................. [OK in 0.03s]
-02:53:10  16 of 19 OK created sql microbatch model main.gold_feature_daily ............... [SUCCESS in 0.28s]
-02:53:10  17 of 19 START test dbt_utils_free_unique_combination_gold_feature_daily_user_id__event_date  [RUN]
-02:53:10  17 of 19 PASS dbt_utils_free_unique_combination_gold_feature_daily_user_id__event_date  [PASS in 0.04s]
-02:53:10  18 of 19 START test not_null_gold_feature_daily_event_date ..................... [RUN]
-02:53:10  18 of 19 PASS not_null_gold_feature_daily_event_date ........................... [PASS in 0.01s]
-02:53:10  19 of 19 START test not_null_gold_feature_daily_user_id ........................ [RUN]
-02:53:10  19 of 19 PASS not_null_gold_feature_daily_user_id .............................. [PASS in 0.03s]
-02:53:10  
-02:53:10  Finished running 3 incremental models, 13 data tests, 1 unit test, 2 view models in 0 hours 0 minutes and 1.44 seconds (1.44s).
-02:53:10  
-02:53:10  Completed successfully
-02:53:10  
-02:53:10  Done. PASS=19 WARN=0 ERROR=0 SKIP=0 NO-OP=0 REUSED=0 TOTAL=19
+03:00:07  Running with dbt=1.12.5
+03:00:07  Registered adapter: duckdb=1.11.0
+03:00:07  Found 5 models, 13 data tests, 2 sources, 502 macros, 1 unit test
+03:00:07  
+03:00:07  Concurrency: 1 threads (target='dev')
+03:00:07  
+03:00:08  1 of 19 START sql view model main.stg_events ................................... [RUN]
+03:00:08  1 of 19 OK created sql view model main.stg_events .............................. [OK in 0.08s]
+03:00:08  2 of 19 START sql view model main.stg_ticket_changes ........................... [RUN]
+03:00:08  2 of 19 OK created sql view model main.stg_ticket_changes ...................... [OK in 0.03s]
+03:00:08  3 of 19 START sql incremental model main.silver_events ......................... [RUN]
+03:00:08  3 of 19 OK created sql incremental model main.silver_events .................... [OK in 0.11s]
+03:00:08  4 of 19 START unit_test silver_tickets::silver_tickets_latest_change_wins_and_delete_is_tombstone  [RUN]
+03:00:08  4 of 19 PASS silver_tickets::silver_tickets_latest_change_wins_and_delete_is_tombstone  [PASS in 0.10s]
+03:00:08  8 of 19 START sql incremental model main.silver_tickets ........................ [RUN]
+03:00:08  8 of 19 OK created sql incremental model main.silver_tickets ................... [OK in 0.12s]
+03:00:08  5 of 19 START test not_null_silver_events_event_id ............................. [RUN]
+03:00:08  5 of 19 PASS not_null_silver_events_event_id ................................... [PASS in 0.03s]
+03:00:08  6 of 19 START test not_null_silver_events_user_id .............................. [RUN]
+03:00:08  6 of 19 PASS not_null_silver_events_user_id .................................... [PASS in 0.01s]
+03:00:08  7 of 19 START test unique_silver_events_event_id ............................... [RUN]
+03:00:08  7 of 19 PASS unique_silver_events_event_id ..................................... [PASS in 0.02s]
+03:00:08  9 of 19 START test accepted_values_silver_tickets_category__bug__billing__other  [RUN]
+03:00:08  9 of 19 PASS accepted_values_silver_tickets_category__bug__billing__other ...... [PASS in 0.03s]
+03:00:08  10 of 19 START test accepted_values_silver_tickets_priority__low__medium__high . [RUN]
+03:00:08  10 of 19 PASS accepted_values_silver_tickets_priority__low__medium__high ....... [PASS in 0.02s]
+03:00:08  11 of 19 START test accepted_values_silver_tickets_status__open__pending__closed  [RUN]
+03:00:08  11 of 19 PASS accepted_values_silver_tickets_status__open__pending__closed ..... [PASS in 0.02s]
+03:00:08  12 of 19 START test not_null_silver_tickets__lsn ............................... [RUN]
+03:00:08  12 of 19 PASS not_null_silver_tickets__lsn ..................................... [PASS in 0.01s]
+03:00:08  13 of 19 START test not_null_silver_tickets_is_deleted ......................... [RUN]
+03:00:08  13 of 19 PASS not_null_silver_tickets_is_deleted ............................... [PASS in 0.01s]
+03:00:08  14 of 19 START test not_null_silver_tickets_ticket_id .......................... [RUN]
+03:00:08  14 of 19 PASS not_null_silver_tickets_ticket_id ................................ [PASS in 0.01s]
+03:00:08  15 of 19 START test unique_silver_tickets_ticket_id ............................ [RUN]
+03:00:08  15 of 19 PASS unique_silver_tickets_ticket_id .................................. [PASS in 0.01s]
+03:00:08  16 of 19 START sql microbatch model main.gold_feature_daily .................... [RUN]
+03:00:08  Batch 1 of 7 START batch 2026-08-10 of main.gold_feature_daily ....................... [RUN]
+03:00:08  Batch 1 of 7 OK created batch 2026-08-10 of main.gold_feature_daily .................. [OK in 0.04s]
+03:00:08  Batch 2 of 7 START batch 2026-08-11 of main.gold_feature_daily ....................... [RUN]
+03:00:08  Batch 2 of 7 OK created batch 2026-08-11 of main.gold_feature_daily .................. [OK in 0.03s]
+03:00:08  Batch 3 of 7 START batch 2026-08-12 of main.gold_feature_daily ....................... [RUN]
+03:00:08  Batch 3 of 7 OK created batch 2026-08-12 of main.gold_feature_daily .................. [OK in 0.03s]
+03:00:08  Batch 4 of 7 START batch 2026-08-13 of main.gold_feature_daily ....................... [RUN]
+03:00:08  Batch 4 of 7 OK created batch 2026-08-13 of main.gold_feature_daily .................. [OK in 0.02s]
+03:00:08  Batch 5 of 7 START batch 2026-08-14 of main.gold_feature_daily ....................... [RUN]
+03:00:08  Batch 5 of 7 OK created batch 2026-08-14 of main.gold_feature_daily .................. [OK in 0.03s]
+03:00:08  Batch 6 of 7 START batch 2026-08-15 of main.gold_feature_daily ....................... [RUN]
+03:00:08  Batch 6 of 7 OK created batch 2026-08-15 of main.gold_feature_daily .................. [OK in 0.03s]
+03:00:08  Batch 7 of 7 START batch 2026-08-16 of main.gold_feature_daily ....................... [RUN]
+03:00:08  Batch 7 of 7 OK created batch 2026-08-16 of main.gold_feature_daily .................. [OK in 0.03s]
+03:00:08  16 of 19 OK created sql microbatch model main.gold_feature_daily ............... [SUCCESS in 0.22s]
+03:00:08  17 of 19 START test dbt_utils_free_unique_combination_gold_feature_daily_user_id__event_date  [RUN]
+03:00:08  17 of 19 PASS dbt_utils_free_unique_combination_gold_feature_daily_user_id__event_date  [PASS in 0.02s]
+03:00:08  18 of 19 START test not_null_gold_feature_daily_event_date ..................... [RUN]
+03:00:08  18 of 19 PASS not_null_gold_feature_daily_event_date ........................... [PASS in 0.02s]
+03:00:08  19 of 19 START test not_null_gold_feature_daily_user_id ........................ [RUN]
+03:00:09  19 of 19 PASS not_null_gold_feature_daily_user_id .............................. [PASS in 0.01s]
+03:00:09  
+03:00:09  Finished running 3 incremental models, 13 data tests, 1 unit test, 2 view models in 0 hours 0 minutes and 1.07 seconds (1.07s).
+03:00:09  
+03:00:09  Completed successfully
+03:00:09  
+03:00:09  Done. PASS=19 WARN=0 ERROR=0 SKIP=0 NO-OP=0 REUSED=0 TOTAL=19
 
 $ .\.venv\Scripts\python.exe -m scripts.parity
 === parity: lite pipeline vs dbt ===
@@ -176,7 +176,7 @@ RESULT: PARITY — both implementations agree
 
 ### Bonus
 
-**B1 — LLM step** (`pipeline/llm_label.py`): cache key = sha256(model + prompt_version + text) trong `llm_label_cache`; mọi câu trả lời thô (kể cả sai schema) đều được cache nên chạy lại = 0 call; `parse_label` validate, câu trả lời ngoài `bug/billing/other` vào `llm_label_quarantine`; ước tính token/chi phí trước khi gọi; mỗi dòng Gold mang `model` + `prompt_version`.
+**B1 — LLM step** (`pipeline/llm_label.py`): cache key = sha256(model + prompt_version + text) trong `llm_label_cache`; mọi câu trả lời thô (kể cả sai schema) được cache nên chạy lại = 0 call; `parse_label` validate, nhãn ngoài `bug/billing/other` vào `llm_label_quarantine`; ước tính token/chi phí trước khi gọi; mỗi dòng Gold mang `model` + `prompt_version`.
 
 ```text
 $ .\.venv\Scripts\python.exe -m scripts.bonus_llm
@@ -192,4 +192,3 @@ BONUS PASS
 ```
 
 **B2 — (b) brainstorm:** [`bonus/DESIGN.md`](../bonus/DESIGN.md) — pipeline hồ sơ khám bệnh scan → RAG cho bác sĩ tuyến huyện (6 quyết định có đánh đổi, phương án bị loại: knowledge graph toàn bộ bệnh án, sơ đồ kiến trúc).
-
