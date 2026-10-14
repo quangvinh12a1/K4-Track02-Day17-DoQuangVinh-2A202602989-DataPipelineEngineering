@@ -173,3 +173,23 @@ $ .\.venv\Scripts\python.exe -m scripts.parity
   [OK ] gold_feature_daily   lite 8630e04a61d1  dbt 8630e04a61d1
 RESULT: PARITY — both implementations agree
 ```
+
+### Bonus
+
+**B1 — LLM step** (`pipeline/llm_label.py`): cache key = sha256(model + prompt_version + text) trong `llm_label_cache`; mọi câu trả lời thô (kể cả sai schema) đều được cache nên chạy lại = 0 call; `parse_label` validate, câu trả lời ngoài `bug/billing/other` vào `llm_label_quarantine`; ước tính token/chi phí trước khi gọi; mỗi dòng Gold mang `model` + `prompt_version`.
+
+```text
+$ .\.venv\Scripts\python.exe -m scripts.bonus_llm
+=== bonus: LLM labelling of 11 live tickets ===
+  cost estimate before running: ~484 tokens = $0.0010 per full run
+  [OK ] first run labels every live ticket
+  [OK ] re-run with same model + prompt makes 0 LLM calls
+  [OK ] every Gold label is bug / billing / other
+  [OK ] off-schema answers go to llm_label_quarantine
+  [OK ] new prompt version re-labels on purpose
+  [OK ] labels carry their prompt version
+BONUS PASS
+```
+
+**B2 — (b) brainstorm:** [`bonus/DESIGN.md`](../bonus/DESIGN.md) — pipeline hồ sơ khám bệnh scan → RAG cho bác sĩ tuyến huyện (6 quyết định có đánh đổi, phương án bị loại: knowledge graph toàn bộ bệnh án, sơ đồ kiến trúc).
+
